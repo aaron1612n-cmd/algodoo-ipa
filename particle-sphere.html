@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Particle Sphere Loop</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #04050a; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, CX, CY;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  CX = W / 2;
+  CY = H / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const COUNT = 420;
+const SPHERE_R = () => Math.min(W, H) * 0.26;
+
+// Phase durations (seconds)
+const T_CHAOS = 3.0;
+const T_CONVERGE = 1.8;
+const T_HOLD = 1.3;
+const T_EXPLODE = 1.6;
+const CYCLE = T_CHAOS + T_CONVERGE + T_HOLD + T_EXPLODE;
+
+let clock = 0;
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+class Particle {
+  constructor() {
+    // chaotic free-roam state (centered coordinates: offsets from canvas center)
+    this.x = rand(-W / 2, W / 2);
+    this.y = rand(-H / 2, H / 2);
+    this.z = rand(-1, 1);
+    this.vx = rand(-40, 40);
+    this.vy = rand(-40, 40);
+    this.vz = rand(-0.4, 0.4);
+
+    // assigned point on the sphere (fixed per particle, evenly distributed via fibonacci sphere)
+    this.hue = rand(190, 320);
+    this.baseR = rand(1.3, 2.6);
+
+    // sphere-hold position captured at convergence completion (for pulse jitter)
+    this.sx = 0; this.sy = 0; this.sz = 0;
+
+    // explosion velocity, assigned at explode start
+    this.ex = 0; this.ey = 0; this.ez = 0;
+  }
+
+  assignSpherePoint(i, n) {
+    // Fibonacci sphere for even distribution
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const yv = 1 - (i / (n - 1)) * 2;
+    const radiusAtY = Math.sqrt(1 - yv * yv);
+    const theta = golden * i;
+    this.sx = Math.cos(theta) * radiusAtY;
+    this.sy = yv;
+    this.sz = Math.sin(theta) * radiusAtY;
+  }
+}
+
+const particles = [];
+for (let i = 0; i < COUNT; i++) particles.push(new Particle());
+particles.forEach((p, i) => p.assignSpherePoint(i, COUNT));
+
+// per-particle chaos-start snapshot, captured whenever a new chaos phase begins
+function seedChaos(p) {
+  p.x = rand(-W / 2, W / 2);
+  p.y = rand(-H / 2, H / 2);
+  p.z = rand(-1, 1);
+  p.vx = rand(-40, 40);
+  p.vy = rand(-40, 40);
+  p.vz = rand(-0.4, 0.4);
+}
+
+// per-particle converge-start snapshot (captured at the moment convergence begins)
+function seedConverge(p) {
+  p.cx0 = p.x; p.cy0 = p.y; p.cz0 = p.z;
+}
+
+function seedExplode(p) {
+  const dx = p.sx, dy = p.sy, dz = p.sz;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  const speed = rand(220, 420);
+  p.ex = (dx / len) * speed + rand(-60, 60);
+  p.ey = (dy / len) * speed + rand(-60, 60);
+  p.ez = (dz / len) * speed + rand(-60, 60);
+  p.ex0 = p.x; p.ey0 = p.y; p.ez0 = p.z;
+}
+
+let rotation = 0;
+let phase = 'chaos';
+let phaseTimer = 0;
+let lastPhase = null;
+
+function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+function easeOutExpo(t) { return t >= 1 ? 1 : 1 - Math.pow(2, -10 * t); }
+
+function project(x, y, z) {
+  const scale = 420 / (420 - z);
+  return { x: CX + x * scale, y: CY + y * scale, scale };
+}
+
+function update(dt) {
+  clock += dt;
+  phaseTimer += dt;
+  rotation += dt * 0.6;
+
+  if (phase === 'chaos') {
+    for (const p of particles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      if (p.x < -W / 2 || p.x > W / 2) p.vx *= -1;
+      if (p.y < -H / 2 || p.y > H / 2) p.vy *= -1;
+      if (p.z < -1 || p.z > 1) p.vz *= -1;
+      p.x = Math.max(-W / 2, Math.min(W / 2, p.x));
+      p.y = Math.max(-H / 2, Math.min(H / 2, p.y));
+      p.z = Math.max(-1, Math.min(1, p.z));
+    }
+    if (phaseTimer >= T_CHAOS) {
+      particles.forEach(seedConverge);
+      phase = 'converge';
+      phaseTimer = 0;
+    }
+  } else if (phase === 'converge') {
+    const t = easeInOutCubic(Math.min(phaseTimer / T_CONVERGE, 1));
+    const r = SPHERE_R();
+    const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+    for (const p of particles) {
+      const tx = (p.sx * cosR - p.sz * sinR) * r;
+      const tz = (p.sx * sinR + p.sz * cosR) * r;
+      const ty = p.sy * r;
+      p.x = p.cx0 + (tx - p.cx0) * t;
+      p.y = p.cy0 + (ty - p.cy0) * t;
+      p.z = p.cz0 + (tz - p.cz0) * t;
+    }
+    if (phaseTimer >= T_CONVERGE) {
+      phase = 'hold';
+      phaseTimer = 0;
+    }
+  } else if (phase === 'hold') {
+    const r = SPHERE_R();
+    const pulse = 1 + Math.sin(phaseTimer * 6) * 0.045 * easeOutCubic(Math.min(phaseTimer / 0.3, 1));
+    const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+    for (const p of particles) {
+      const tx = (p.sx * cosR - p.sz * sinR) * r * pulse;
+      const tz = (p.sx * sinR + p.sz * cosR) * r * pulse;
+      const ty = p.sy * r * pulse;
+      p.x = tx; p.y = ty; p.z = tz;
+    }
+    if (phaseTimer >= T_HOLD) {
+      particles.forEach(seedExplode);
+      phase = 'explode';
+      phaseTimer = 0;
+    }
+  } else if (phase === 'explode') {
+    const t = Math.min(phaseTimer / T_EXPLODE, 1);
+    const e = easeOutExpo(t);
+    for (const p of particles) {
+      p.x = p.ex0 + p.ex * e * (T_EXPLODE);
+      p.y = p.ey0 + p.ey * e * (T_EXPLODE);
+      p.z = p.ez0 + p.ez * e * (T_EXPLODE);
+    }
+    if (phaseTimer >= T_EXPLODE) {
+      particles.forEach(seedChaos);
+      phase = 'chaos';
+      phaseTimer = 0;
+    }
+  }
+}
+
+// ---- Background stars (static, subtle) ----
+const stars = [];
+for (let i = 0; i < 100; i++) {
+  stars.push({ x: Math.random(), y: Math.random(), r: Math.random() * 1.2 + 0.2 });
+}
+
+function drawBackground() {
+  ctx.fillStyle = 'rgba(4,5,10,0.28)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  for (const s of stars) {
+    ctx.beginPath();
+    ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function draw() {
+  drawBackground();
+
+  const holdPulseGlow = phase === 'hold' ? 1 + Math.sin(phaseTimer * 6) * 0.5 : 0;
+
+  const sorted = [...particles].sort((a, b) => a.z - b.z);
+  for (const p of sorted) {
+    const proj = project(p.x, p.y, p.z);
+    const depthFade = Math.max(0.25, Math.min(1, proj.scale));
+    const size = p.baseR * proj.scale * (1 + (phase === 'hold' ? holdPulseGlow * 0.3 : 0));
+    const alpha = depthFade;
+
+    const lightness = phase === 'hold' ? 65 + holdPulseGlow * 15 : 60;
+    ctx.beginPath();
+    ctx.fillStyle = `hsla(${p.hue}, 90%, ${lightness}%, ${alpha})`;
+    ctx.shadowColor = `hsla(${p.hue}, 100%, 70%, ${alpha})`;
+    ctx.shadowBlur = 8 * proj.scale * (phase === 'hold' ? 1 + holdPulseGlow * 0.6 : 1);
+    ctx.arc(proj.x, proj.y, Math.max(0.4, size), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+}
+
+let last = performance.now();
+function loop(now) {
+  let dt = (now - last) / 1000;
+  dt = Math.min(dt, 1 / 30);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
