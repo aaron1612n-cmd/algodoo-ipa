@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Particle Sphere Loop</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #04050a; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, CX, CY;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  CX = W / 2;
+  CY = H / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const COUNT = 420;
+const SPHERE_R = () => Math.min(W, H) * 0.26;
+const FOCAL = 460;      // camera distance for the perspective projection
+const Z_LIMIT = 170;    // keep particles well in front of the camera plane
+// Perspective magnifies off-center particles, so hold the swarm inside a margin
+// that keeps most of it in frame instead of drifting past the edges.
+const SWARM_FILL = 0.8;
+
+// Phase durations (seconds)
+const T_CHAOS = 3.0;
+const T_CONVERGE = 1.8;
+const T_HOLD = 1.3;
+const T_EXPLODE = 1.6;
+const CYCLE = T_CHAOS + T_CONVERGE + T_HOLD + T_EXPLODE;
+
+let clock = 0;
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+class Particle {
+  constructor() {
+    // chaotic free-roam state (centered coordinates: offsets from canvas center)
+    this.x = rand(-W / 2, W / 2) * SWARM_FILL;
+    this.y = rand(-H / 2, H / 2) * SWARM_FILL;
+    this.z = rand(-Z_LIMIT, Z_LIMIT);
+    this.vx = rand(-60, 60);
+    this.vy = rand(-60, 60);
+    this.vz = rand(-60, 60);
+
+    // assigned point on the sphere (fixed per particle, evenly distributed via fibonacci sphere)
+    this.hue = rand(190, 320);
+    this.baseR = rand(1.3, 2.6);
+
+    // assigned point on the unit sphere (set by assignSpherePoint)
+    this.sx = 0; this.sy = 0; this.sz = 0;
+  }
+
+  assignSpherePoint(i, n) {
+    // Fibonacci sphere for even distribution
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const yv = 1 - (i / (n - 1)) * 2;
+    const radiusAtY = Math.sqrt(1 - yv * yv);
+    const theta = golden * i;
+    this.sx = Math.cos(theta) * radiusAtY;
+    this.sy = yv;
+    this.sz = Math.sin(theta) * radiusAtY;
+  }
+}
+
+const particles = [];
+for (let i = 0; i < COUNT; i++) particles.push(new Particle());
+particles.forEach((p, i) => p.assignSpherePoint(i, COUNT));
+
+// per-particle converge-start snapshot (captured at the moment convergence begins)
+function seedConverge(p) {
+  p.cx0 = p.x; p.cy0 = p.y; p.cz0 = p.z;
+}
+
+// Blow each particle outward along its own radius. The blast is integrated as real
+// velocity, so the particle can carry that motion straight into the chaos phase —
+// the swarm decelerates and drifts instead of teleporting to new random positions.
+function seedExplode(p) {
+  const len = Math.hypot(p.x, p.y, p.z) || 1;
+  const speed = rand(260, 460);
+  p.vx = (p.x / len) * speed + rand(-50, 50);
+  p.vy = (p.y / len) * speed + rand(-50, 50);
+  p.vz = (p.z / len) * speed + rand(-50, 50);
+}
+
+let rotation = 0;
+let phase = 'chaos';
+let phaseTimer = 0;
+let lastPhase = null;
+
+function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+function project(x, y, z) {
+  // Clamp z well in front of the camera plane: at z -> FOCAL the scale blows up to
+  // infinity and past it the particle mirrors through the origin.
+  const zc = Math.max(-FOCAL * 0.9, Math.min(Z_LIMIT, z));
+  const scale = FOCAL / (FOCAL - zc);
+  return { x: CX + x * scale, y: CY + y * scale, scale };
+}
+
+function update(dt) {
+  clock += dt;
+  phaseTimer += dt;
+  rotation += dt * 0.6;
+
+  if (phase === 'chaos') {
+    const bx = (W / 2) * SWARM_FILL, by = (H / 2) * SWARM_FILL, bz = Z_LIMIT;
+    const damping = Math.pow(0.55, dt);   // bleeds off leftover explosion speed
+    const SPRING = 5;                     // pulls strays back into the viewport
+    const WANDER = 90;                    // keeps the swarm restless
+    for (const p of particles) {
+      p.vx += rand(-1, 1) * WANDER * dt;
+      p.vy += rand(-1, 1) * WANDER * dt;
+      p.vz += rand(-1, 1) * WANDER * dt;
+
+      // Soft containment: force proportional to how far outside the bounds it is,
+      // so particles thrown clear by the explosion curve back into frame.
+      if (p.x > bx) p.vx -= (p.x - bx) * SPRING * dt;
+      else if (p.x < -bx) p.vx -= (p.x + bx) * SPRING * dt;
+      if (p.y > by) p.vy -= (p.y - by) * SPRING * dt;
+      else if (p.y < -by) p.vy -= (p.y + by) * SPRING * dt;
+      if (p.z > bz) p.vz -= (p.z - bz) * SPRING * dt;
+      else if (p.z < -bz) p.vz -= (p.z + bz) * SPRING * dt;
+
+      p.vx *= damping; p.vy *= damping; p.vz *= damping;
+
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+    }
+    if (phaseTimer >= T_CHAOS) {
+      particles.forEach(seedConverge);
+      phase = 'converge';
+      phaseTimer = 0;
+    }
+  } else if (phase === 'converge') {
+    const t = easeInOutCubic(Math.min(phaseTimer / T_CONVERGE, 1));
+    const r = SPHERE_R();
+    const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+    for (const p of particles) {
+      const tx = (p.sx * cosR - p.sz * sinR) * r;
+      const tz = (p.sx * sinR + p.sz * cosR) * r;
+      const ty = p.sy * r;
+      p.x = p.cx0 + (tx - p.cx0) * t;
+      p.y = p.cy0 + (ty - p.cy0) * t;
+      p.z = p.cz0 + (tz - p.cz0) * t;
+    }
+    if (phaseTimer >= T_CONVERGE) {
+      phase = 'hold';
+      phaseTimer = 0;
+    }
+  } else if (phase === 'hold') {
+    const r = SPHERE_R();
+    const pulse = 1 + Math.sin(phaseTimer * 6) * 0.045 * easeOutCubic(Math.min(phaseTimer / 0.3, 1));
+    const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+    for (const p of particles) {
+      const tx = (p.sx * cosR - p.sz * sinR) * r * pulse;
+      const tz = (p.sx * sinR + p.sz * cosR) * r * pulse;
+      const ty = p.sy * r * pulse;
+      p.x = tx; p.y = ty; p.z = tz;
+    }
+    if (phaseTimer >= T_HOLD) {
+      particles.forEach(seedExplode);
+      phase = 'explode';
+      phaseTimer = 0;
+    }
+  } else if (phase === 'explode') {
+    // Velocity-integrated blast with drag, so it decays into the drifting swarm
+    // rather than cutting to a fresh set of random positions.
+    const drag = Math.pow(0.22, dt);
+    for (const p of particles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      p.vx *= drag; p.vy *= drag; p.vz *= drag;
+    }
+    if (phaseTimer >= T_EXPLODE) {
+      phase = 'chaos';
+      phaseTimer = 0;
+    }
+  }
+}
+
+// ---- Background stars (static, subtle) ----
+const stars = [];
+for (let i = 0; i < 100; i++) {
+  stars.push({ x: Math.random(), y: Math.random(), r: Math.random() * 1.2 + 0.2 });
+}
+
+function drawBackground() {
+  ctx.fillStyle = 'rgba(4,5,10,0.28)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  for (const s of stars) {
+    ctx.beginPath();
+    ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function draw() {
+  drawBackground();
+
+  const holdPulseGlow = phase === 'hold' ? 1 + Math.sin(phaseTimer * 6) * 0.5 : 0;
+
+  const sorted = [...particles].sort((a, b) => a.z - b.z);
+  for (const p of sorted) {
+    const proj = project(p.x, p.y, p.z);
+    const depthFade = Math.max(0.25, Math.min(1, proj.scale));
+    const size = p.baseR * proj.scale * (1 + (phase === 'hold' ? holdPulseGlow * 0.3 : 0));
+    const alpha = depthFade;
+
+    const lightness = phase === 'hold' ? 65 + holdPulseGlow * 15 : 60;
+    ctx.beginPath();
+    ctx.fillStyle = `hsla(${p.hue}, 90%, ${lightness}%, ${alpha})`;
+    ctx.shadowColor = `hsla(${p.hue}, 100%, 70%, ${alpha})`;
+    ctx.shadowBlur = 8 * proj.scale * (phase === 'hold' ? 1 + holdPulseGlow * 0.6 : 1);
+    ctx.arc(proj.x, proj.y, Math.max(0.4, size), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+}
+
+let last = performance.now();
+function loop(now) {
+  let dt = (now - last) / 1000;
+  dt = Math.min(dt, 1 / 30);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Animated Fractal Tree</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0f0b; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script>
+const MAX_DEPTH = 9;
+const START_LEN = 130;
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  angleMode(RADIANS);
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+
+function draw() {
+  background(11, 15, 11);
+  const t = millis();
+  const sway = sin(t / 900) * 0.35;
+
+  push();
+  translate(width / 2, height);
+  branch(START_LEN, MAX_DEPTH, sway);
+  pop();
+}
+
+function branch(len, depth, sway) {
+  const weight = map(depth, 0, MAX_DEPTH, 1, 10);
+  const col = lerpColor(
+    color(101, 67, 33),   // brown at trunk (depth = MAX_DEPTH)
+    color(60, 200, 90),   // green at tips (depth = 0)
+    map(depth, 0, MAX_DEPTH, 1, 0)
+  );
+
+  stroke(col);
+  strokeWeight(weight);
+  line(0, 0, 0, -len);
+  translate(0, -len);
+
+  if (depth <= 0) return;
+
+  const baseAngle = radians(25) + sway * (1 - depth / MAX_DEPTH);
+  const wiggle = sin(millis() / 500 + depth) * 0.12;
+  const angleA = baseAngle + wiggle;
+  const angleB = baseAngle - wiggle;
+  const nextLen = len * 0.72;
+
+  push();
+  rotate(angleA);
+  branch(nextLen, depth - 1, sway);
+  pop();
+
+  push();
+  rotate(-angleB);
+  branch(nextLen, depth - 1, sway);
+  pop();
+}
+</script>
+</body>
+</html>
