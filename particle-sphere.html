@@ -26,6 +26,11 @@ resize();
 
 const COUNT = 420;
 const SPHERE_R = () => Math.min(W, H) * 0.26;
+const FOCAL = 460;      // camera distance for the perspective projection
+const Z_LIMIT = 170;    // keep particles well in front of the camera plane
+// Perspective magnifies off-center particles, so hold the swarm inside a margin
+// that keeps most of it in frame instead of drifting past the edges.
+const SWARM_FILL = 0.8;
 
 // Phase durations (seconds)
 const T_CHAOS = 3.0;
@@ -41,22 +46,19 @@ function rand(a, b) { return a + Math.random() * (b - a); }
 class Particle {
   constructor() {
     // chaotic free-roam state (centered coordinates: offsets from canvas center)
-    this.x = rand(-W / 2, W / 2);
-    this.y = rand(-H / 2, H / 2);
-    this.z = rand(-1, 1);
-    this.vx = rand(-40, 40);
-    this.vy = rand(-40, 40);
-    this.vz = rand(-0.4, 0.4);
+    this.x = rand(-W / 2, W / 2) * SWARM_FILL;
+    this.y = rand(-H / 2, H / 2) * SWARM_FILL;
+    this.z = rand(-Z_LIMIT, Z_LIMIT);
+    this.vx = rand(-60, 60);
+    this.vy = rand(-60, 60);
+    this.vz = rand(-60, 60);
 
     // assigned point on the sphere (fixed per particle, evenly distributed via fibonacci sphere)
     this.hue = rand(190, 320);
     this.baseR = rand(1.3, 2.6);
 
-    // sphere-hold position captured at convergence completion (for pulse jitter)
+    // assigned point on the unit sphere (set by assignSpherePoint)
     this.sx = 0; this.sy = 0; this.sz = 0;
-
-    // explosion velocity, assigned at explode start
-    this.ex = 0; this.ey = 0; this.ez = 0;
   }
 
   assignSpherePoint(i, n) {
@@ -75,29 +77,20 @@ const particles = [];
 for (let i = 0; i < COUNT; i++) particles.push(new Particle());
 particles.forEach((p, i) => p.assignSpherePoint(i, COUNT));
 
-// per-particle chaos-start snapshot, captured whenever a new chaos phase begins
-function seedChaos(p) {
-  p.x = rand(-W / 2, W / 2);
-  p.y = rand(-H / 2, H / 2);
-  p.z = rand(-1, 1);
-  p.vx = rand(-40, 40);
-  p.vy = rand(-40, 40);
-  p.vz = rand(-0.4, 0.4);
-}
-
 // per-particle converge-start snapshot (captured at the moment convergence begins)
 function seedConverge(p) {
   p.cx0 = p.x; p.cy0 = p.y; p.cz0 = p.z;
 }
 
+// Blow each particle outward along its own radius. The blast is integrated as real
+// velocity, so the particle can carry that motion straight into the chaos phase —
+// the swarm decelerates and drifts instead of teleporting to new random positions.
 function seedExplode(p) {
-  const dx = p.sx, dy = p.sy, dz = p.sz;
-  const len = Math.hypot(dx, dy, dz) || 1;
-  const speed = rand(220, 420);
-  p.ex = (dx / len) * speed + rand(-60, 60);
-  p.ey = (dy / len) * speed + rand(-60, 60);
-  p.ez = (dz / len) * speed + rand(-60, 60);
-  p.ex0 = p.x; p.ey0 = p.y; p.ez0 = p.z;
+  const len = Math.hypot(p.x, p.y, p.z) || 1;
+  const speed = rand(260, 460);
+  p.vx = (p.x / len) * speed + rand(-50, 50);
+  p.vy = (p.y / len) * speed + rand(-50, 50);
+  p.vz = (p.z / len) * speed + rand(-50, 50);
 }
 
 let rotation = 0;
@@ -107,10 +100,12 @@ let lastPhase = null;
 
 function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
 function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
-function easeOutExpo(t) { return t >= 1 ? 1 : 1 - Math.pow(2, -10 * t); }
 
 function project(x, y, z) {
-  const scale = 420 / (420 - z);
+  // Clamp z well in front of the camera plane: at z -> FOCAL the scale blows up to
+  // infinity and past it the particle mirrors through the origin.
+  const zc = Math.max(-FOCAL * 0.9, Math.min(Z_LIMIT, z));
+  const scale = FOCAL / (FOCAL - zc);
   return { x: CX + x * scale, y: CY + y * scale, scale };
 }
 
@@ -120,16 +115,29 @@ function update(dt) {
   rotation += dt * 0.6;
 
   if (phase === 'chaos') {
+    const bx = (W / 2) * SWARM_FILL, by = (H / 2) * SWARM_FILL, bz = Z_LIMIT;
+    const damping = Math.pow(0.55, dt);   // bleeds off leftover explosion speed
+    const SPRING = 5;                     // pulls strays back into the viewport
+    const WANDER = 90;                    // keeps the swarm restless
     for (const p of particles) {
+      p.vx += rand(-1, 1) * WANDER * dt;
+      p.vy += rand(-1, 1) * WANDER * dt;
+      p.vz += rand(-1, 1) * WANDER * dt;
+
+      // Soft containment: force proportional to how far outside the bounds it is,
+      // so particles thrown clear by the explosion curve back into frame.
+      if (p.x > bx) p.vx -= (p.x - bx) * SPRING * dt;
+      else if (p.x < -bx) p.vx -= (p.x + bx) * SPRING * dt;
+      if (p.y > by) p.vy -= (p.y - by) * SPRING * dt;
+      else if (p.y < -by) p.vy -= (p.y + by) * SPRING * dt;
+      if (p.z > bz) p.vz -= (p.z - bz) * SPRING * dt;
+      else if (p.z < -bz) p.vz -= (p.z + bz) * SPRING * dt;
+
+      p.vx *= damping; p.vy *= damping; p.vz *= damping;
+
       p.x += p.vx * dt;
       p.y += p.vy * dt;
       p.z += p.vz * dt;
-      if (p.x < -W / 2 || p.x > W / 2) p.vx *= -1;
-      if (p.y < -H / 2 || p.y > H / 2) p.vy *= -1;
-      if (p.z < -1 || p.z > 1) p.vz *= -1;
-      p.x = Math.max(-W / 2, Math.min(W / 2, p.x));
-      p.y = Math.max(-H / 2, Math.min(H / 2, p.y));
-      p.z = Math.max(-1, Math.min(1, p.z));
     }
     if (phaseTimer >= T_CHAOS) {
       particles.forEach(seedConverge);
@@ -168,15 +176,16 @@ function update(dt) {
       phaseTimer = 0;
     }
   } else if (phase === 'explode') {
-    const t = Math.min(phaseTimer / T_EXPLODE, 1);
-    const e = easeOutExpo(t);
+    // Velocity-integrated blast with drag, so it decays into the drifting swarm
+    // rather than cutting to a fresh set of random positions.
+    const drag = Math.pow(0.22, dt);
     for (const p of particles) {
-      p.x = p.ex0 + p.ex * e * (T_EXPLODE);
-      p.y = p.ey0 + p.ey * e * (T_EXPLODE);
-      p.z = p.ez0 + p.ez * e * (T_EXPLODE);
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      p.vx *= drag; p.vy *= drag; p.vz *= drag;
     }
     if (phaseTimer >= T_EXPLODE) {
-      particles.forEach(seedChaos);
       phase = 'chaos';
       phaseTimer = 0;
     }
