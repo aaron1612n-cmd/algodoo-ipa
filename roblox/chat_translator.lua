@@ -56,16 +56,35 @@ end
 --------------------------------------------------------------------------
 local requestFn = (syn and syn.request) or (http and http.request) or http_request or request
 
+-- Returns body, or nil plus a reason string. Every transport this executor
+-- might expose is tried in turn: request() exists on some executors but is
+-- blocked or broken there while HttpGet still works, so failing one must not
+-- abandon the others. The reason is surfaced to the user, since "translation
+-- failed" on its own is not diagnosable.
 local function httpGet(url)
-    if requestFn then
-        local ok, res = pcall(requestFn, { Url = url, Method = "GET" })
-        if ok and type(res) == "table" and type(res.Body) == "string" then
-            return res.Body
-        end
-        return nil
-    end
+    local reasons = {}
+
     local ok, body = pcall(function() return game:HttpGet(url, true) end)
-    return ok and body or nil
+    if ok and type(body) == "string" and body ~= "" then return body end
+    reasons[#reasons + 1] = "HttpGet " .. tostring(body)
+
+    if requestFn then
+        local rok, res = pcall(requestFn, { Url = url, Method = "GET" })
+        if rok and type(res) == "table" then
+            local rbody = res.Body or res.body
+            if type(rbody) == "string" and rbody ~= "" then return rbody end
+            reasons[#reasons + 1] = "request status "
+                .. tostring(res.StatusCode or res.status_code)
+        else
+            reasons[#reasons + 1] = "request " .. tostring(res)
+        end
+    end
+
+    local gok, gbody = pcall(function() return HttpService:GetAsync(url, true) end)
+    if gok and type(gbody) == "string" and gbody ~= "" then return gbody end
+    reasons[#reasons + 1] = "GetAsync " .. tostring(gbody)
+
+    return nil, table.concat(reasons, " | ")
 end
 
 --------------------------------------------------------------------------
@@ -73,40 +92,76 @@ end
 --------------------------------------------------------------------------
 local cache = {}
 
--- Returns translatedText, detectedSourceLang (or nil on failure)
+-- The plain gtx endpoint gets rate limited and then answers with an HTML
+-- "Sorry..." interstitial rather than JSON, which is indistinguishable from a
+-- translation failure. The dict-chrome-ex endpoint returns structured JSON and
+-- held up when gtx was already blocked, so it leads and gtx is the fallback.
+local ENDPOINTS = {
+    {
+        url = "https://clients5.google.com/translate_a/single?dj=1&dt=t&sl=auto&ie=UTF-8&oe=UTF-8&client=dict-chrome-ex&tl=%s&q=%s",
+        parse = function(data)
+            if type(data.sentences) ~= "table" then return nil end
+            local parts = {}
+            for _, sentence in ipairs(data.sentences) do
+                if type(sentence.trans) == "string" then
+                    parts[#parts + 1] = sentence.trans
+                end
+            end
+            if #parts == 0 then return nil end
+            return table.concat(parts),
+                   (type(data.src) == "string" and data.src) or "auto"
+        end,
+    },
+    {
+        url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=%s&dt=t&q=%s",
+        parse = function(data)
+            if type(data[1]) ~= "table" then return nil end
+            -- data[1] is a list of sentence chunks; joining keeps long messages whole.
+            local parts = {}
+            for _, chunk in ipairs(data[1]) do
+                if type(chunk) == "table" and type(chunk[1]) == "string" then
+                    parts[#parts + 1] = chunk[1]
+                end
+            end
+            if #parts == 0 then return nil end
+            local detected = (type(data[3]) == "string" and data[3])
+                          or (type(data[2]) == "string" and data[2])
+                          or "auto"
+            return table.concat(parts), detected
+        end,
+    },
+}
+
+-- Returns translatedText, detectedSourceLang, or nil plus a reason.
 local function translate(text, target)
     local key = target .. "\0" .. text
     local hit = cache[key]
     if hit then return hit[1], hit[2] end
 
-    local url = string.format(
-        "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=%s&dt=t&q=%s",
-        HttpService:UrlEncode(target),
-        HttpService:UrlEncode(text)
-    )
+    local encodedTarget = HttpService:UrlEncode(target)
+    local encodedText   = HttpService:UrlEncode(text)
+    local reasons = {}
 
-    local body = httpGet(url)
-    if not body then return nil end
-
-    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-    if not ok or type(data) ~= "table" or type(data[1]) ~= "table" then return nil end
-
-    -- data[1] is a list of sentence chunks; joining them keeps long messages whole.
-    local parts = {}
-    for _, chunk in ipairs(data[1]) do
-        if type(chunk) == "table" and type(chunk[1]) == "string" then
-            parts[#parts + 1] = chunk[1]
+    for _, endpoint in ipairs(ENDPOINTS) do
+        local body, reason = httpGet(string.format(endpoint.url, encodedTarget, encodedText))
+        if body then
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if ok and type(data) == "table" then
+                local out, detected = endpoint.parse(data)
+                if out then
+                    cache[key] = { out, detected }
+                    return out, detected
+                end
+                reasons[#reasons + 1] = "no text in reply"
+            else
+                reasons[#reasons + 1] = "not JSON: " .. body:sub(1, 50)
+            end
+        else
+            reasons[#reasons + 1] = tostring(reason)
         end
     end
-    if #parts == 0 then return nil end
 
-    local out = table.concat(parts)
-    local detected = (type(data[3]) == "string" and data[3])
-                  or (type(data[2]) == "string" and data[2])
-                  or "auto"
-
-    cache[key] = { out, detected }
-    return out, detected
+    return nil, table.concat(reasons, " | ")
 end
 
 --------------------------------------------------------------------------
@@ -226,11 +281,11 @@ local function submitText(text)
         end
 
         if state.outEnabled and text:sub(1, 1) ~= "/" then
-            local translated = translate(text, state.outLang)
+            local translated, reason = translate(text, state.outLang)
             if translated then
                 sendToServer(translated)
             else
-                feed("Translation failed - sent original.")
+                feed("Translation failed - sent original. " .. tostring(reason):sub(1, 160))
                 sendToServer(text)
             end
         else
