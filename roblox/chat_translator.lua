@@ -1,20 +1,20 @@
 --[[
     Parallel Chat Translator
     ------------------------
-    Outgoing : your messages are translated before they reach the server.
-    Incoming : other players' messages are translated into your language
-               and shown as an extra line under the original.
+    Outgoing : you type into the translator's own input bar. What you type is
+               translated, then sent. Roblox's default chat bar is driven by a
+               CoreScript in a separate Luau VM, so an executor hook cannot
+               intercept it -- owning the input is the only reliable route.
+    Incoming : other players' messages are translated into your language and
+               shown as an extra line.
 
-    Commands (typed into normal chat, they are swallowed and never sent):
+    Commands, typed into the translator bar:
         >ja  >es  >pt-br ...   set OUTGOING language + enable
         >d                     disable outgoing translation
         >in en                 set INCOMING language + enable
         >in off                disable incoming translation
         >tr                    show current status
         >help                  show commands
-
-    Requires an executor that exposes getrawmetatable/setreadonly (for the
-    outgoing hook). Incoming translation works without it.
 ]]
 
 local Players           = game:GetService("Players")
@@ -27,16 +27,29 @@ local LocalPlayer       = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
 --------------------------------------------------------------------------
--- State (kept across re-executions so the hook is only installed once)
+-- State
 --------------------------------------------------------------------------
-local state = env.__ChatTranslatorState or {
+-- An older version of this script installed a namecall hook that cannot be
+-- uninstalled for the rest of the session. It reads outEnabled off the shared
+-- state table, so it would intercept this version's own SendAsync call and
+-- translate an already-translated message. Park it by clearing the flag it
+-- keys on, and keep this version's state under a separate name.
+local legacy = env.__ChatTranslatorState
+if type(legacy) == "table" then legacy.outEnabled = false end
+
+local state = env.__ChatTranslatorStateV2 or {
     outEnabled = false,
     outLang    = "en",
     inEnabled  = true,
     inLang     = "en",
-    hooked     = false,
 }
-env.__ChatTranslatorState = state
+env.__ChatTranslatorStateV2 = state
+
+-- Tear down a previous run's UI so re-executing does not stack input bars.
+if env.__ChatTranslatorGui then
+    pcall(function() env.__ChatTranslatorGui:Destroy() end)
+    env.__ChatTranslatorGui = nil
+end
 
 --------------------------------------------------------------------------
 -- HTTP
@@ -51,9 +64,7 @@ local function httpGet(url)
         end
         return nil
     end
-    local ok, body = pcall(function()
-        return game:HttpGet(url, true)
-    end)
+    local ok, body = pcall(function() return game:HttpGet(url, true) end)
     return ok and body or nil
 end
 
@@ -62,7 +73,7 @@ end
 --------------------------------------------------------------------------
 local cache = {}
 
--- Returns translatedText, detectedSourceLang  (or nil on failure)
+-- Returns translatedText, detectedSourceLang (or nil on failure)
 local function translate(text, target)
     local key = target .. "\0" .. text
     local hit = cache[key]
@@ -80,8 +91,7 @@ local function translate(text, target)
     local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
     if not ok or type(data) ~= "table" or type(data[1]) ~= "table" then return nil end
 
-    -- data[1] is a LIST of sentence chunks. The original script only read
-    -- chunk 1, which truncated anything longer than one sentence.
+    -- data[1] is a list of sentence chunks; joining them keeps long messages whole.
     local parts = {}
     for _, chunk in ipairs(data[1]) do
         if type(chunk) == "table" and type(chunk[1]) == "string" then
@@ -102,8 +112,6 @@ end
 --------------------------------------------------------------------------
 -- Chat plumbing
 --------------------------------------------------------------------------
-local usingTextChatService = TextChatService.ChatVersion == Enum.ChatVersion.TextChatService
-
 local function getChannel()
     local channels = TextChatService:FindFirstChild("TextChannels")
     if not channels then return nil end
@@ -115,84 +123,70 @@ local function getChannel()
     return nil
 end
 
-local function getLegacyRemote()
-    local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
-    local remote = events and events:FindFirstChild("SayMessageRequest")
-                or ReplicatedStorage:FindFirstChild("SayMessageRequest", true)
-    if remote and remote:IsA("RemoteEvent") then return remote end
-    return nil
-end
-
--- DisplaySystemMessage parses rich text, so player-authored text must be escaped
-local function escapeRich(s)
-    return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
-end
-
+-- Plain text: some games style the chat window with rich text disabled, and
+-- markup then shows up literally.
 local function feed(text)
     local channel = getChannel()
     if channel then
-        local ok = pcall(function()
-            channel:DisplaySystemMessage(
-                "<font color=\"#00FFCC\">[Translator] " .. escapeRich(text) .. "</font>"
-            )
-        end)
+        local ok = pcall(function() channel:DisplaySystemMessage("[TR] " .. text) end)
         if ok then return end
     end
     pcall(function()
         StarterGui:SetCore("ChatMakeSystemMessage", {
-            Text  = "[Translator] " .. text,
+            Text  = "[TR] " .. text,
             Color = Color3.fromRGB(0, 255, 204),
-            Font  = Enum.Font.SourceSansBold,
         })
     end)
 end
 
--- Messages we generated ourselves, so the outgoing hook lets them through.
-local passthrough = {}
-
 local function sendToServer(text)
-    passthrough[text] = true
-    task.defer(function() passthrough[text] = nil end)
-
-    local channel = usingTextChatService and getChannel()
+    local channel = getChannel()
     if channel then
-        pcall(function() channel:SendAsync(text) end)
-        return
+        local ok, err = pcall(function() channel:SendAsync(text) end)
+        if ok then return true end
+        feed("send failed: " .. tostring(err))
+        return false
     end
-    local remote = getLegacyRemote()
-    if remote then
+
+    local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    local remote = events and events:FindFirstChild("SayMessageRequest")
+    if remote and remote:IsA("RemoteEvent") then
         pcall(function() remote:FireServer(text, "All") end)
+        return true
     end
+
+    feed("no way to send found")
+    return false
 end
 
 --------------------------------------------------------------------------
 -- Commands
 --------------------------------------------------------------------------
-local function status()
-    feed(string.format(
-        "outgoing: %s (%s)  |  incoming: %s (%s)",
+local refreshBadge -- set once the UI exists
+
+local function statusText()
+    return string.format("out %s (%s) | in %s (%s)",
         state.outEnabled and "ON" or "OFF", state.outLang:upper(),
-        state.inEnabled  and "ON" or "OFF", state.inLang:upper()
-    ))
+        state.inEnabled  and "ON" or "OFF", state.inLang:upper())
 end
 
--- Returns true if the text was a command and must NOT be sent to the server.
+-- Returns true if the text was a command and must not be sent.
 local function handleCommand(text)
     local lower = text:lower():match("^%s*(.-)%s*$")
 
     if lower == ">d" or lower == ">off" then
         state.outEnabled = false
-        feed("Outgoing translation OFF. Raw messages restored.")
+        feed("Outgoing translation OFF.")
         return true
     end
 
     if lower == ">tr" then
-        status()
+        feed(statusText())
         return true
     end
 
     if lower == ">help" then
-        feed(">xx = outgoing lang | >d = outgoing off | >in xx / >in off | >tr = status")
+        feed(">xx set lang | >d off | >in xx | >in off | >tr status")
         return true
     end
 
@@ -202,7 +196,7 @@ local function handleCommand(text)
             state.inEnabled = false
             feed("Incoming translation OFF.")
         else
-            state.inLang   = incoming
+            state.inLang    = incoming
             state.inEnabled = true
             feed("Incoming translation ON -> [" .. incoming:upper() .. "]")
         end
@@ -220,66 +214,147 @@ local function handleCommand(text)
     return false
 end
 
---------------------------------------------------------------------------
--- Outgoing interception
---------------------------------------------------------------------------
--- Returns true when the original call must be swallowed.
-local function handleOutgoing(text)
-    if type(text) ~= "string" or text == "" then return false end
-    if passthrough[text] then return false end
-    if handleCommand(text) then return true end
-    if not state.outEnabled then return false end
-    if text:sub(1, 1) == "/" then return false end -- /e dance, /w, etc.
+local function submitText(text)
+    if type(text) ~= "string" then return end
+    text = text:match("^%s*(.-)%s*$")
+    if text == "" then return end
 
     task.spawn(function()
-        local translated = translate(text, state.outLang)
-        sendToServer(translated or text)
-        if not translated then
-            feed("Translation failed - sent original.")
+        if handleCommand(text) then
+            if refreshBadge then refreshBadge() end
+            return
+        end
+
+        if state.outEnabled and text:sub(1, 1) ~= "/" then
+            local translated = translate(text, state.outLang)
+            if translated then
+                sendToServer(translated)
+            else
+                feed("Translation failed - sent original.")
+                sendToServer(text)
+            end
+        else
+            sendToServer(text)
         end
     end)
-    return true
 end
 
--- Games often ship a custom chat UI that sends through its own RemoteEvent
--- rather than the stock SayMessageRequest, so match on shape, not one name.
-local function looksLikeChatRemote(inst)
-    local ok, lower = pcall(function() return inst.Name:lower() end)
-    if not ok then return false end
-    return (lower:find("chat") or lower:find("say") or lower:find("message")
-         or lower:find("talk") or lower:find("speak")) ~= nil
-end
+--------------------------------------------------------------------------
+-- Input bar
+--------------------------------------------------------------------------
+local function buildUI()
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
 
-if not state.hooked then
-    local canHook = getrawmetatable and setreadonly and getnamecallmethod
-    if canHook then
-        local mt = getrawmetatable(game)
-        local oldNamecall = mt.__namecall
-        local wrap = newcclosure or function(f) return f end
+    local gui = Instance.new("ScreenGui")
+    gui.Name             = "ChatTranslatorInput"
+    gui.ResetOnSpawn     = false
+    gui.IgnoreGuiInset   = true
+    gui.DisplayOrder     = 999
+    gui.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
 
-        setreadonly(mt, false)
-        mt.__namecall = wrap(function(self, ...)
-            local method = getnamecallmethod()
-
-            if method == "SendAsync" or method == "FireServer" then
-                local ok, isInstance = pcall(function() return typeof(self) == "Instance" end)
-                if ok and isInstance then
-                    local isChatSend =
-                        (method == "SendAsync" and self:IsA("TextChannel")) or
-                        (method == "FireServer" and looksLikeChatRemote(self))
-
-                    if isChatSend and handleOutgoing((...)) then
-                        return nil
-                    end
-                end
-            end
-
-            return oldNamecall(self, ...)
-        end)
-        setreadonly(mt, true)
-        state.hooked = true
+    local ok = pcall(function() gui.Parent = parent end)
+    if not ok then
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
     end
+    if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+    env.__ChatTranslatorGui = gui
+
+    local bar = Instance.new("Frame")
+    bar.Name                   = "Bar"
+    bar.AnchorPoint            = Vector2.new(0.5, 1)
+    bar.Position               = UDim2.new(0.5, 0, 1, -110)
+    bar.Size                   = UDim2.new(0.72, 0, 0, 46)
+    bar.BackgroundColor3       = Color3.fromRGB(24, 26, 30)
+    bar.BackgroundTransparency = 0.12
+    bar.BorderSizePixel        = 0
+    bar.Parent                 = gui
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 10)
+
+    local box = Instance.new("TextBox")
+    box.Name                   = "Input"
+    box.Position               = UDim2.new(0, 12, 0, 0)
+    box.Size                   = UDim2.new(1, -150, 1, 0)
+    box.BackgroundTransparency = 1
+    box.ClearTextOnFocus       = false
+    box.Text                   = ""
+    box.PlaceholderText        = "type here to translate & send"
+    box.PlaceholderColor3      = Color3.fromRGB(140, 145, 155)
+    box.TextColor3             = Color3.fromRGB(240, 242, 245)
+    box.TextSize               = 18
+    box.Font                   = Enum.Font.GothamMedium
+    box.TextXAlignment         = Enum.TextXAlignment.Left
+    box.TextTruncate           = Enum.TextTruncate.AtEnd
+    box.Parent                 = bar
+
+    local badge = Instance.new("TextLabel")
+    badge.Name                   = "Badge"
+    badge.AnchorPoint            = Vector2.new(1, 0.5)
+    badge.Position               = UDim2.new(1, -84, 0.5, 0)
+    badge.Size                   = UDim2.new(0, 48, 0, 26)
+    badge.BackgroundColor3       = Color3.fromRGB(45, 48, 55)
+    badge.BorderSizePixel        = 0
+    badge.TextColor3             = Color3.fromRGB(0, 255, 204)
+    badge.TextSize               = 14
+    badge.Font                   = Enum.Font.GothamBold
+    badge.Text                   = "OFF"
+    badge.Parent                 = bar
+    Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 6)
+
+    local send = Instance.new("TextButton")
+    send.Name             = "Send"
+    send.AnchorPoint      = Vector2.new(1, 0.5)
+    send.Position         = UDim2.new(1, -8, 0.5, 0)
+    send.Size             = UDim2.new(0, 68, 0, 32)
+    send.BackgroundColor3 = Color3.fromRGB(0, 145, 120)
+    send.BorderSizePixel  = 0
+    send.AutoButtonColor  = true
+    send.TextColor3       = Color3.fromRGB(255, 255, 255)
+    send.TextSize         = 15
+    send.Font             = Enum.Font.GothamBold
+    send.Text             = "Send"
+    send.Parent           = bar
+    Instance.new("UICorner", send).CornerRadius = UDim.new(0, 8)
+
+    local toggle = Instance.new("TextButton")
+    toggle.Name             = "Toggle"
+    toggle.AnchorPoint      = Vector2.new(0.5, 1)
+    toggle.Position         = UDim2.new(0.5, 0, 1, -164)
+    toggle.Size             = UDim2.new(0, 44, 0, 24)
+    toggle.BackgroundColor3 = Color3.fromRGB(24, 26, 30)
+    toggle.BackgroundTransparency = 0.2
+    toggle.BorderSizePixel  = 0
+    toggle.TextColor3       = Color3.fromRGB(200, 205, 215)
+    toggle.TextSize         = 13
+    toggle.Font             = Enum.Font.GothamBold
+    toggle.Text             = "hide"
+    toggle.Parent           = gui
+    Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 6)
+
+    refreshBadge = function()
+        badge.Text = state.outEnabled and state.outLang:upper() or "OFF"
+    end
+    refreshBadge()
+
+    local function submit()
+        local text = box.Text
+        box.Text = ""
+        submitText(text)
+    end
+
+    box.FocusLost:Connect(function(enterPressed)
+        if enterPressed then submit() end
+    end)
+    send.MouseButton1Click:Connect(submit)
+
+    toggle.MouseButton1Click:Connect(function()
+        bar.Visible = not bar.Visible
+        toggle.Text = bar.Visible and "hide" or "show"
+    end)
+
+    return gui
 end
+
+local uiOk, uiErr = pcall(buildUI)
 
 --------------------------------------------------------------------------
 -- Incoming translation
@@ -294,43 +369,29 @@ local function showIncoming(speaker, original, target)
     feed(string.format("%s [%s]: %s", speaker, detected:upper(), translated))
 end
 
-if usingTextChatService then
-    TextChatService.OnIncomingMessage = function(message)
-        -- This callback must never yield, so all work goes to a new thread.
-        if not state.inEnabled then return end
+TextChatService.OnIncomingMessage = function(message)
+    -- Must not yield, so the work goes to a separate thread.
+    if not state.inEnabled then return end
 
-        local source = message.TextSource
-        if not source then return end                        -- system message
-        if source.UserId == LocalPlayer.UserId then return end
+    local source = message.TextSource
+    if not source then return end
+    if source.UserId == LocalPlayer.UserId then return end
 
-        local text = message.Text
-        if not text or text == "" then return end
-        if seen[message.MessageId] then return end
-        seen[message.MessageId] = true
+    local text = message.Text
+    if not text or text == "" then return end
+    if seen[message.MessageId] then return end
+    seen[message.MessageId] = true
 
-        local player = Players:GetPlayerByUserId(source.UserId)
-        local name = player and player.DisplayName or "?"
+    local player = Players:GetPlayerByUserId(source.UserId)
+    local name = player and player.DisplayName or "?"
 
-        task.spawn(showIncoming, name, text, state.inLang)
-        return nil
-    end
-else
-    local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
-    local onFiltered = events and events:FindFirstChild("OnMessageDoneFiltering")
-    if onFiltered and onFiltered:IsA("RemoteEvent") then
-        onFiltered.OnClientEvent:Connect(function(data)
-            if not state.inEnabled then return end
-            if type(data) ~= "table" then return end
-            if not data.Message or data.Message == "" then return end
-            if data.FromSpeaker == LocalPlayer.Name then return end
-            task.spawn(showIncoming, data.FromSpeaker or "?", data.Message, state.inLang)
-        end)
-    end
+    task.spawn(showIncoming, name, text, state.inLang)
+    return nil
 end
 
 --------------------------------------------------------------------------
-feed("Loaded. Try '>ja' to translate what you send, '>in en' for what you read.")
-if not state.hooked then
-    feed("WARNING: no getrawmetatable - outgoing translation is unavailable in this executor.")
+feed("Loaded. Type in the TRANSLATOR BAR at the bottom, not the game's chat.")
+feed("Try >ja then type a message. " .. statusText())
+if not uiOk then
+    feed("INPUT BAR FAILED: " .. tostring(uiErr))
 end
-status()

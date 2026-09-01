@@ -3,6 +3,11 @@
 Translates your outgoing chat messages into a language you set, and translates
 other players' incoming messages into your language.
 
+**You type into the translator's own input bar at the bottom of the screen, not
+the game's chat box.** Roblox's default chat bar is driven by a CoreScript
+running in a separate Luau VM, so an executor hook cannot intercept it; owning
+the input is the only reliable way to replace a message before it is sent.
+
 ## Load
 
 ```lua
@@ -17,20 +22,17 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aaron1612n-cmd/algodo
 
 ## If your messages still send untranslated
 
-Some games ship a custom chat GUI instead of Roblox's default one, and some
-executors cannot see the send at all. Run the diagnostic to find out which:
+Check you are typing into the translator bar and not the game's chat box. If
+the bar never appeared, the load message says `INPUT BAR FAILED` with the
+reason. To inspect the chat setup directly, run the diagnostic:
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aaron1612n-cmd/algodoo-ipa/main/roblox/chat_diagnostic.lua"))()
 ```
 
-Then type a message containing `zzdiag`. It prints yellow `[DIAG]` lines:
-
-- a `MATCH method=... obj=...` line names exactly what carries your chat to
-  the server, so the translator can be pointed at it.
-- no `MATCH` line means the send happens in the CoreScript VM, outside the
-  metatable your executor hooked. A namecall hook cannot intercept it there,
-  and the translator needs its own input box instead.
+Then type `zzdiag hello` and wait for the `VERDICT:` line. It reports whether
+any call in the hooked VM carries your chat text, lists the channels, and
+tests that `SendAsync` can still deliver a message.
 
 ## Commands
 
