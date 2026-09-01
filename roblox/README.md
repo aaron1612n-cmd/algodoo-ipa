@@ -15,6 +15,23 @@ Pinned to a specific commit (does not pick up later changes):
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aaron1612n-cmd/algodoo-ipa/2ef2084722d3269f4e7856e6c630455f08c19ff0/roblox/chat_translator.lua"))()
 ```
 
+## If your messages still send untranslated
+
+Some games ship a custom chat GUI instead of Roblox's default one, and some
+executors cannot see the send at all. Run the diagnostic to find out which:
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/aaron1612n-cmd/algodoo-ipa/main/roblox/chat_diagnostic.lua"))()
+```
+
+Then type a message containing `zzdiag`. It prints yellow `[DIAG]` lines:
+
+- a `MATCH method=... obj=...` line names exactly what carries your chat to
+  the server, so the translator can be pointed at it.
+- no `MATCH` line means the send happens in the CoreScript VM, outside the
+  metatable your executor hooked. A namecall hook cannot intercept it there,
+  and the translator needs its own input box instead.
+
 ## Commands
 
 Typed into normal chat. They are swallowed and never sent to the server.

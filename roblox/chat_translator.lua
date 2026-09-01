@@ -241,6 +241,15 @@ local function handleOutgoing(text)
     return true
 end
 
+-- Games often ship a custom chat UI that sends through its own RemoteEvent
+-- rather than the stock SayMessageRequest, so match on shape, not one name.
+local function looksLikeChatRemote(inst)
+    local ok, lower = pcall(function() return inst.Name:lower() end)
+    if not ok then return false end
+    return (lower:find("chat") or lower:find("say") or lower:find("message")
+         or lower:find("talk") or lower:find("speak")) ~= nil
+end
+
 if not state.hooked then
     local canHook = getrawmetatable and setreadonly and getnamecallmethod
     if canHook then
@@ -257,7 +266,7 @@ if not state.hooked then
                 if ok and isInstance then
                     local isChatSend =
                         (method == "SendAsync" and self:IsA("TextChannel")) or
-                        (method == "FireServer" and self.Name == "SayMessageRequest")
+                        (method == "FireServer" and looksLikeChatRemote(self))
 
                     if isChatSend and handleOutgoing((...)) then
                         return nil
