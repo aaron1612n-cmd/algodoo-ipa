@@ -61,28 +61,64 @@ local requestFn = (syn and syn.request) or (http and http.request) or http_reque
 -- blocked or broken there while HttpGet still works, so failing one must not
 -- abandon the others. The reason is surfaced to the user, since "translation
 -- failed" on its own is not diagnosable.
+-- Google answers a rate-limited or unconsented caller with an HTML page (a
+-- "Sorry..." interstitial or a consent form) under HTTP 200. That is never a
+-- valid reply from a JSON endpoint, so an HTML body counts as a failure and the
+-- next transport or endpoint gets a turn, instead of the HTML reaching
+-- JSONDecode and surfacing as an unexplained translation failure.
+local function isHtml(body)
+    -- JSON always opens with { or [; only markup opens with <. Matching on the
+    -- first non-space character avoids flagging a translation that merely
+    -- contains a tag-like substring.
+    return body:match("^%s*(.)") == "<"
+end
+
 local function httpGet(url)
     local reasons = {}
 
-    local ok, body = pcall(function() return game:HttpGet(url, true) end)
-    if ok and type(body) == "string" and body ~= "" then return body end
-    reasons[#reasons + 1] = "HttpGet " .. tostring(body)
+    local function usable(body, label)
+        if type(body) ~= "string" or body == "" then
+            reasons[#reasons + 1] = label .. " empty"
+            return nil
+        end
+        if isHtml(body) then
+            reasons[#reasons + 1] = label .. " got HTML (blocked/consent)"
+            return nil
+        end
+        return body
+    end
 
+    local ok, body = pcall(function() return game:HttpGet(url, true) end)
+    if ok then
+        local good = usable(body, "HttpGet")
+        if good then return good end
+    else
+        reasons[#reasons + 1] = "HttpGet " .. tostring(body)
+    end
+
+    -- Only request() can set headers, and the CONSENT cookie is what clears
+    -- Google's consent interstitial -- the same trick Nameless Admin uses.
     if requestFn then
-        local rok, res = pcall(requestFn, { Url = url, Method = "GET" })
+        local rok, res = pcall(requestFn, {
+            Url = url,
+            Method = "GET",
+            Headers = { cookie = "CONSENT=YES+" },
+        })
         if rok and type(res) == "table" then
-            local rbody = res.Body or res.body
-            if type(rbody) == "string" and rbody ~= "" then return rbody end
-            reasons[#reasons + 1] = "request status "
-                .. tostring(res.StatusCode or res.status_code)
+            local good = usable(res.Body or res.body, "request")
+            if good then return good end
         else
             reasons[#reasons + 1] = "request " .. tostring(res)
         end
     end
 
     local gok, gbody = pcall(function() return HttpService:GetAsync(url, true) end)
-    if gok and type(gbody) == "string" and gbody ~= "" then return gbody end
-    reasons[#reasons + 1] = "GetAsync " .. tostring(gbody)
+    if gok then
+        local good = usable(gbody, "GetAsync")
+        if good then return good end
+    else
+        reasons[#reasons + 1] = "GetAsync " .. tostring(gbody)
+    end
 
     return nil, table.concat(reasons, " | ")
 end
@@ -295,6 +331,48 @@ local function submitText(text)
 end
 
 --------------------------------------------------------------------------
+-- Native chat box interception
+--------------------------------------------------------------------------
+-- The CoreScript that calls SendAsync is unreachable from this VM, but the
+-- TextBox it reads is not: Roblox's input bar is an ordinary GUI under
+-- CoreGui.ExperienceChat. Taking the text and blanking the box before the
+-- CoreScript's own handler reads it replaces the message without any hook.
+local function attachNativeChat()
+    local CoreGui = game:GetService("CoreGui")
+
+    local experienceChat = CoreGui:WaitForChild("ExperienceChat", 20)
+    if not experienceChat then return false, "ExperienceChat not found" end
+
+    local ok, box, button = pcall(function()
+        local container = experienceChat:WaitForChild("appLayout", 10)
+            :WaitForChild("chatInputBar", 10)
+            :WaitForChild("Background", 10)
+            :WaitForChild("Container", 10)
+        local textContainer = container:WaitForChild("TextContainer", 10)
+        return textContainer:WaitForChild("TextBoxContainer", 10):WaitForChild("TextBox", 10),
+               container:WaitForChild("SendButton", 10)
+    end)
+    if not ok then return false, tostring(box) end
+    if not box then return false, "TextBox not found" end
+
+    local function grab()
+        local text = box.Text
+        if text == "" then return end
+        box.Text = ""
+        submitText(text)
+    end
+
+    box.FocusLost:Connect(function(enterPressed)
+        if enterPressed then grab() end
+    end)
+    if button then
+        button.MouseButton1Click:Connect(grab)
+    end
+
+    return true
+end
+
+--------------------------------------------------------------------------
 -- Input bar
 --------------------------------------------------------------------------
 local function buildUI()
@@ -424,8 +502,10 @@ local function showIncoming(speaker, original, target)
     feed(string.format("%s [%s]: %s", speaker, detected:upper(), translated))
 end
 
-TextChatService.OnIncomingMessage = function(message)
-    -- Must not yield, so the work goes to a separate thread.
+-- MessageReceived rather than the OnIncomingMessage callback property: it is a
+-- plain event, so it carries no no-yield restriction and does not fight another
+-- script for ownership of a single callback slot.
+TextChatService.MessageReceived:Connect(function(message)
     if not state.inEnabled then return end
 
     local source = message.TextSource
@@ -441,11 +521,19 @@ TextChatService.OnIncomingMessage = function(message)
     local name = player and player.DisplayName or "?"
 
     task.spawn(showIncoming, name, text, state.inLang)
-    return nil
-end
+end)
 
 --------------------------------------------------------------------------
-feed("Loaded. Type in the TRANSLATOR BAR at the bottom, not the game's chat.")
+task.spawn(function()
+    local attached, why = attachNativeChat()
+    if attached then
+        feed("Game's own chat box hooked - you can type there or in the bar.")
+    else
+        feed("Game's chat box not hooked (" .. tostring(why) .. ") - use the bar.")
+    end
+end)
+
+feed("Loaded.")
 feed("Try >ja then type a message. " .. statusText())
 if not uiOk then
     feed("INPUT BAR FAILED: " .. tostring(uiErr))

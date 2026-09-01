@@ -3,10 +3,16 @@
 Translates your outgoing chat messages into a language you set, and translates
 other players' incoming messages into your language.
 
-**You type into the translator's own input bar at the bottom of the screen, not
-the game's chat box.** Roblox's default chat bar is driven by a CoreScript
-running in a separate Luau VM, so an executor hook cannot intercept it; owning
-the input is the only reliable way to replace a message before it is sent.
+You can type into **either** the game's own chat box or the translator's input
+bar at the bottom of the screen.
+
+Roblox's chat bar is driven by a CoreScript in a separate Luau VM, so an
+executor hook on the game metatable never sees its `SendAsync` call. The
+TextBox it reads is reachable though: it is an ordinary GUI under
+`CoreGui.ExperienceChat`. The script takes the text and blanks the box before
+the CoreScript reads it, which replaces the message without any hook. If that
+GUI path is not present, the load message says so and the translator bar is
+the fallback.
 
 ## Load
 
