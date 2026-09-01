@@ -42,6 +42,7 @@ local state = env.__ChatTranslatorStateV2 or {
     outLang    = "en",
     inEnabled  = true,
     inLang     = "en",
+    nativeHook = true,
 }
 env.__ChatTranslatorStateV2 = state
 
@@ -277,7 +278,21 @@ local function handleCommand(text)
     end
 
     if lower == ">help" then
-        feed(">xx set lang | >d off | >in xx | >in off | >tr status")
+        feed(">xx set lang | >d off | >in xx | >in off | >native off | >tr status")
+        return true
+    end
+
+    -- Blanking the box only suppresses the original if our handler runs before
+    -- the CoreScript's. If a Roblox change ever reverses that, both copies go
+    -- out; this turns the native box off and leaves the translator bar.
+    if lower == ">native off" then
+        state.nativeHook = false
+        feed("Game chat box ignored. Use the translator bar.")
+        return true
+    end
+    if lower == ">native on" then
+        state.nativeHook = true
+        feed("Game chat box active again.")
         return true
     end
 
@@ -335,27 +350,68 @@ end
 --------------------------------------------------------------------------
 -- The CoreScript that calls SendAsync is unreachable from this VM, but the
 -- TextBox it reads is not: Roblox's input bar is an ordinary GUI under
--- CoreGui.ExperienceChat. Taking the text and blanking the box before the
--- CoreScript's own handler reads it replaces the message without any hook.
-local function attachNativeChat()
+-- CoreGui. Taking the text and blanking the box before the CoreScript's own
+-- handler reads it replaces the message without any hook.
+--
+-- Nameless Admin walks a fixed path
+-- (ExperienceChat.appLayout.chatInputBar.Background.Container...), and its
+-- translator reportedly stopped working, which is what a renamed node in that
+-- path would look like. So search for the box by shape instead of walking a
+-- path that Roblox is free to restructure.
+local function findChatTextBox()
     local CoreGui = game:GetService("CoreGui")
 
-    local experienceChat = CoreGui:WaitForChild("ExperienceChat", 20)
-    if not experienceChat then return false, "ExperienceChat not found" end
+    local roots = {}
+    for _, child in ipairs(CoreGui:GetChildren()) do
+        local name = child.Name:lower()
+        if name:find("chat") or name:find("experience") then
+            roots[#roots + 1] = child
+        end
+    end
+    if #roots == 0 then return nil, "no chat GUI under CoreGui" end
 
-    local ok, box, button = pcall(function()
-        local container = experienceChat:WaitForChild("appLayout", 10)
-            :WaitForChild("chatInputBar", 10)
-            :WaitForChild("Background", 10)
-            :WaitForChild("Container", 10)
-        local textContainer = container:WaitForChild("TextContainer", 10)
-        return textContainer:WaitForChild("TextBoxContainer", 10):WaitForChild("TextBox", 10),
-               container:WaitForChild("SendButton", 10)
-    end)
-    if not ok then return false, tostring(box) end
-    if not box then return false, "TextBox not found" end
+    local best, bestScore, boxes = nil, -1, 0
+    for _, root in ipairs(roots) do
+        for _, node in ipairs(root:GetDescendants()) do
+            if node:IsA("TextBox") then
+                boxes = boxes + 1
+                local path  = node:GetFullName():lower()
+                local score = 0
+                if path:find("inputbar")         then score = score + 3 end
+                if path:find("chatinput")        then score = score + 3 end
+                if path:find("textboxcontainer") then score = score + 2 end
+                if node.Visible ~= false         then score = score + 1 end
+                if score > bestScore then best, bestScore = node, score end
+            end
+        end
+    end
+
+    if not best then return nil, "chat GUI present but no TextBox in it" end
+    return best, boxes
+end
+
+-- The send button matters on touch devices, where there is no Enter key.
+local function findSendButton(box)
+    local node = box
+    for _ = 1, 5 do
+        node = node.Parent
+        if not node then break end
+        for _, candidate in ipairs(node:GetDescendants()) do
+            if (candidate:IsA("TextButton") or candidate:IsA("ImageButton"))
+                and candidate.Name:lower():find("send") then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
+local function attachNativeChat()
+    local box, info = findChatTextBox()
+    if not box then return false, tostring(info) end
 
     local function grab()
+        if not state.nativeHook then return end
         local text = box.Text
         if text == "" then return end
         box.Text = ""
@@ -365,11 +421,13 @@ local function attachNativeChat()
     box.FocusLost:Connect(function(enterPressed)
         if enterPressed then grab() end
     end)
+
+    local button = findSendButton(box)
     if button then
         button.MouseButton1Click:Connect(grab)
     end
 
-    return true
+    return true, box:GetFullName() .. (button and " (+send button)" or " (no send button)")
 end
 
 --------------------------------------------------------------------------
@@ -525,11 +583,12 @@ end)
 
 --------------------------------------------------------------------------
 task.spawn(function()
-    local attached, why = attachNativeChat()
+    local attached, detail = attachNativeChat()
     if attached then
-        feed("Game's own chat box hooked - you can type there or in the bar.")
+        feed("Hooked game chat box: " .. tostring(detail):sub(1, 150))
+        feed("If your message sends TWICE, type >native off and use the bar.")
     else
-        feed("Game's chat box not hooked (" .. tostring(why) .. ") - use the bar.")
+        feed("Game chat box not hooked (" .. tostring(detail) .. ") - use the bar.")
     end
 end)
 

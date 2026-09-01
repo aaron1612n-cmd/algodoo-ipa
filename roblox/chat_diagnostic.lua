@@ -64,6 +64,49 @@ out("grmt=" .. yn(getrawmetatable) .. " sro=" .. yn(setreadonly)
  .. " hmm=" .. yn(hookmetamethod) .. " clip=" .. yn(setclipboard))
 
 --------------------------------------------------------------------------
+-- Chat input GUI: what TextBoxes exist, and where
+--------------------------------------------------------------------------
+-- Nameless Admin's translator walks a fixed path into CoreGui.ExperienceChat
+-- and reportedly stopped working, which is what a renamed node looks like.
+-- List the boxes so the real path can be read off directly.
+do
+    local CoreGui = game:GetService("CoreGui")
+    local roots = {}
+    for _, child in ipairs(CoreGui:GetChildren()) do
+        local name = child.Name:lower()
+        if name:find("chat") or name:find("experience") then
+            roots[#roots + 1] = child
+        end
+    end
+
+    if #roots == 0 then
+        out("chat GUI: none found under CoreGui")
+    else
+        local names = {}
+        for _, root in ipairs(roots) do names[#names + 1] = root.Name end
+        out("chat GUI roots: " .. table.concat(names, ", "))
+
+        local found = 0
+        for _, root in ipairs(roots) do
+            for _, node in ipairs(root:GetDescendants()) do
+                if node:IsA("TextBox") then
+                    found = found + 1
+                    if found <= 4 then
+                        local path = node:GetFullName()
+                        out("box" .. found .. ": " .. path:sub(-70))
+                    end
+                end
+            end
+        end
+        if found == 0 then
+            out("chat GUI has NO TextBox (chat input may be elsewhere)")
+        else
+            out("total chat TextBoxes: " .. found)
+        end
+    end
+end
+
+--------------------------------------------------------------------------
 -- Hook + self-test
 --------------------------------------------------------------------------
 local selfTest = false
