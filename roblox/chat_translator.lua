@@ -278,13 +278,26 @@ local function handleCommand(text)
     end
 
     if lower == ">help" then
-        feed(">xx set lang | >d off | >in xx | >in off | >native off | >tr status")
+        feed(">xx set lang | >d off | >in xx | >in off | >native off | >debug on | >tr status")
         return true
     end
 
     -- Blanking the box only suppresses the original if our handler runs before
     -- the CoreScript's. If a Roblox change ever reverses that, both copies go
     -- out; this turns the native box off and leaves the translator bar.
+    -- Prints the raw fields of each incoming message, to identify how this
+    -- client actually delivers a rephrased one.
+    if lower == ">debug on" then
+        state.debug = true
+        feed("Debug ON - incoming message fields will be printed.")
+        return true
+    end
+    if lower == ">debug off" then
+        state.debug = false
+        feed("Debug OFF.")
+        return true
+    end
+
     if lower == ">native off" then
         state.nativeHook = false
         feed("Game chat box ignored. Use the translator bar.")
@@ -550,14 +563,40 @@ local uiOk, uiErr = pcall(buildUI)
 --------------------------------------------------------------------------
 -- Incoming translation
 --------------------------------------------------------------------------
-local seen = {}
+-- Keyed by message id AND text. Roblox's safety system rephrases a flagged
+-- message, and the rephrased wording can arrive as a second delivery of the
+-- same message id. Keying on the id alone treated that as a duplicate and
+-- dropped it, so the rephrased text was never translated.
+local seen, seenCount = {}, 0
+local lastTextById = {}
 
-local function showIncoming(speaker, original, target)
+local function alreadyHandled(key)
+    if seen[key] then return true end
+    if seenCount > 400 then
+        seen, seenCount = {}, 0
+    end
+    seen[key] = true
+    seenCount = seenCount + 1
+    return false
+end
+
+-- Reading a property the running client does not have would throw.
+local function prop(instance, name)
+    local ok, value = pcall(function() return instance[name] end)
+    if ok then return value end
+    return nil
+end
+
+local function showIncoming(speaker, original, target, wasRephrased)
     local translated, detected = translate(original, target)
     if not translated then return end
-    if detected == target then return end
+    -- No check on the detected language here: auto-detect is wrong often
+    -- enough that trusting it discarded real translations. Whether the
+    -- translation actually differs from the original is the honest test, and
+    -- it catches the same-language no-op anyway.
     if translated:lower() == original:lower() then return end
-    feed(string.format("%s [%s]: %s", speaker, detected:upper(), translated))
+    feed(string.format("%s [%s]%s: %s",
+        speaker, detected:upper(), wasRephrased and " (rephrased)" or "", translated))
 end
 
 -- MessageReceived rather than the OnIncomingMessage callback property: it is a
@@ -571,14 +610,33 @@ TextChatService.MessageReceived:Connect(function(message)
     if source.UserId == LocalPlayer.UserId then return end
 
     local text = message.Text
+    if not text or text == "" then
+        -- Roblox's own auto-translation lands here; use it when Text is blank.
+        local fallback = prop(message, "Translation")
+        if type(fallback) == "string" then text = fallback end
+    end
     if not text or text == "" then return end
-    if seen[message.MessageId] then return end
-    seen[message.MessageId] = true
+
+    local id = tostring(message.MessageId)
+    if alreadyHandled(id .. "|" .. text) then return end
+
+    -- Same id, different words: this delivery is a rephrase of an earlier one.
+    local previous = lastTextById[id]
+    local wasRephrased = previous ~= nil and previous ~= text
+    lastTextById[id] = text
+
+    if state.debug then
+        feed(string.format("dbg id=%s status=%s meta=%s trans=%s",
+            id:sub(-6),
+            tostring(prop(message, "Status")),
+            tostring(prop(message, "Metadata")):sub(1, 24),
+            tostring(prop(message, "Translation")):sub(1, 24)))
+    end
 
     local player = Players:GetPlayerByUserId(source.UserId)
     local name = player and player.DisplayName or "?"
 
-    task.spawn(showIncoming, name, text, state.inLang)
+    task.spawn(showIncoming, name, text, state.inLang, wasRephrased)
 end)
 
 --------------------------------------------------------------------------

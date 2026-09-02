@@ -51,7 +51,20 @@ Typed into normal chat. They are swallowed and never sent to the server.
 | `>in en` | Set incoming language and enable incoming translation |
 | `>in off` | Disable incoming translation |
 | `>tr` | Show current status |
+| `>debug on` / `>debug off` | Print raw fields of each incoming message |
 | `>help` | List commands |
+
+## Rephrased messages
+
+Roblox's safety system rewrites a flagged message into politer wording and
+delivers the new version. That rephrased text is translated too: the incoming
+guard is keyed on message id **and** text, so a second delivery of the same id
+carrying different words is treated as new rather than as a duplicate. Such a
+line is tagged `(rephrased)`.
+
+If a rephrased message still is not translated on your client, run `>debug on`
+and send the `dbg` line for one, which shows the message's status, metadata and
+translation fields.
 
 ## Requirements
 
